@@ -9,6 +9,11 @@ Everything except the database itself runs on your machine: the model runs in
 Ollama, the orchestration runs in [main.py](main.py), and only the final
 database reads/writes leave your computer (to your Supabase project over HTTPS).
 
+You can talk to it two ways — in the **terminal** (`python main.py`) or in your
+**browser** (`uvicorn web:app`). Both drive the *same* agent; the browser front
+end just reuses [main.py](main.py) behind a small web page. See
+[Use it in the browser](#11-use-it-in-the-browser-web-ui).
+
 ---
 
 ## Table of contents
@@ -23,10 +28,11 @@ database reads/writes leave your computer (to your Supabase project over HTTPS).
 8. [Setup](#8-setup)
 9. [Usage & worked examples](#9-usage--worked-examples)
 10. [Chat commands](#10-chat-commands)
-11. [Configuration](#11-configuration)
-12. [Troubleshooting](#12-troubleshooting)
-13. [Security notes](#13-security-notes)
-14. [File map](#14-file-map)
+11. [Use it in the browser (web UI)](#11-use-it-in-the-browser-web-ui)
+12. [Configuration](#12-configuration)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Security notes](#14-security-notes)
+15. [File map](#15-file-map)
 
 ---
 
@@ -276,7 +282,7 @@ events(id, title, starts_at, program_id -> programs.id, created_at)
 - `events.starts_at` is a `timestamptz` (a full date **and** time).
 
 > **Note:** `students.password` is stored in **plain text** for simplicity. Do
-> not use this as-is for anything real — see [Security notes](#13-security-notes).
+> not use this as-is for anything real — see [Security notes](#14-security-notes).
 
 ---
 
@@ -310,10 +316,17 @@ ollama pull qwen3:1.7b
 ollama serve          # if it isn't already running
 ```
 
-**5. Run it:**
+**5. Run it** — either in the terminal:
 
 ```powershell
 venv\Scripts\python.exe main.py
+```
+
+…or in the browser (see [Use it in the browser](#11-use-it-in-the-browser-web-ui)):
+
+```powershell
+venv\Scripts\python.exe -m uvicorn web:app --reload
+# then open http://localhost:8000
 ```
 
 ---
@@ -378,7 +391,83 @@ without calling the model:
 
 ---
 
-## 11. Configuration
+## 11. Use it in the browser (web UI)
+
+Prefer a browser to the terminal? [web.py](web.py) puts the **same agent** behind
+a small web page. Start it with:
+
+```powershell
+venv\Scripts\python.exe -m uvicorn web:app --reload
+```
+
+then open **http://localhost:8000**. (Ollama must still be running —
+`ollama serve` — exactly as for the terminal version.)
+
+### It reuses the agent — it does not reimplement it
+
+[web.py](web.py) does `import main` and calls `main`'s own `SYSTEM_PROMPT`,
+`TOOLS`, `chat_once()`, and `dispatch_tool()`. Nothing about the agent changes.
+web.py only adds a *different front end* (a "harness") around it:
+
+```
+   ┌───────────────┐     HTTP      ┌──────────────────────┐        same
+   │  Browser UI   │  <-------->   │   web.py (FastAPI)   │  <-->  Ollama +
+   │  static/      │   /api/...    │  - one session / tab │        Supabase
+   │  index.html   │               │  - reuses main.py    │        as the CLI
+   └───────────────┘               └──────────────────────┘
+```
+
+Compare the two front ends: [main.py](main.py)'s `run_agent()` reads with
+`input()` and prints to the screen; [web.py](web.py)'s `run_turn()` runs the
+identical loop but sends each step to the browser as JSON. Same brain, same
+tools, different skin.
+
+### The confirm step becomes an Approve / Decline button
+
+In the terminal a write pauses on `[confirm] ... [y/N]`. In the browser it
+pauses on a button instead. web.py makes this swap with a single line at the
+bottom of the file:
+
+```python
+main.confirm = web_confirm   # reroute every write's approval to the browser
+```
+
+Because the tools look up `confirm` on the `main` module **at call time**, this
+reroutes approvals to the browser without editing a single tool.
+
+### Why a turn runs in the background
+
+The agent can stop mid-turn to ask for approval, which does not fit a plain
+request → response. So each turn runs in its own thread and the browser polls
+for what the agent is doing:
+
+```
+  You type     ──►  POST /api/message     (starts a background thread)
+                         │
+  Browser polls ◄─────── GET /api/events  returns: tool call, result,
+     every 0.5s                            a "confirm" prompt, the answer
+                         │
+  On a "confirm":   the thread BLOCKS until you click Approve / Decline
+  Your click   ──►  POST /api/confirm      (unblocks the thread; loop resumes)
+```
+
+Sessions live in memory, one per browser tab, so restarting the server clears
+history — fine for exploring, not meant for production.
+
+### Endpoints
+
+| Route | Purpose |
+|---|---|
+| `GET /` | The chat page ([static/index.html](static/index.html)) |
+| `GET /api/info` | Model name, tables/columns, tools, and whether Supabase is configured |
+| `POST /api/message` | Start an agent turn for a session (creates one if needed) |
+| `GET /api/events` | Poll the events produced so far (tool calls, results, confirms, answer) |
+| `POST /api/confirm` | Approve or decline a pending write |
+| `POST /api/reset` | Clear a session's history (keeps the system prompt) |
+
+---
+
+## 12. Configuration
 
 All at the top of [main.py](main.py):
 
@@ -395,7 +484,7 @@ To add a table or column, edit `ALLOWED_TABLES` and mention it in
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 - **"Could not reach Ollama…"** — start it with `ollama serve` and confirm the
   model is pulled (`ollama list`).
@@ -411,7 +500,7 @@ To add a table or column, edit `ALLOWED_TABLES` and mention it in
 
 ---
 
-## 13. Security notes
+## 14. Security notes
 
 - **Plain-text passwords.** `students.password` is stored as-is. For real use,
   hash passwords (e.g. bcrypt) and never store the raw value.
@@ -423,11 +512,13 @@ To add a table or column, edit `ALLOWED_TABLES` and mention it in
 
 ---
 
-## 14. File map
+## 15. File map
 
 | File | Role |
 |---|---|
 | [main.py](main.py) | The whole agent: config, tools, the Ollama loop, chat commands |
+| [web.py](web.py) | FastAPI browser front end — reuses `main.py`, adds the web UI + confirm buttons |
+| [static/index.html](static/index.html) | The single-page chat UI served by `web.py` |
 | [schema.sql](schema.sql) | SQL to create the `programs`/`students`/`events` tables |
 | [.env](.env) | Supabase URL + service key (secret — do not commit) |
 | [requirements.txt](requirements.txt) | Pinned Python dependencies |

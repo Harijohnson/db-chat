@@ -39,6 +39,14 @@ ALLOWED_TABLES = {
     "events": {"id", "title", "starts_at", "program_id"},
 }
 
+# Foreign-key columns and the parent table each one points at. We check these
+# before a write so the model gets an actionable hint instead of a raw Postgres
+# foreign-key error (SQLSTATE 23503).
+FOREIGN_KEYS = {
+    "students": {"program_id": "programs"},
+    "events": {"program_id": "programs"},
+}
+
 # How many rows a lookup returns at most, so results stay small for the model.
 FIND_LIMIT = 50
 
@@ -63,7 +71,9 @@ SYSTEM_PROMPT = (
     "  db_delete(table, match)  delete the rows that fit `match`.\n"
     "\n"
     "Rules:\n"
-    "1. Never invent an id. If you need one, call db_find first.\n"
+    "1. Never invent an id. If you need one (e.g. program_id), call db_find\n"
+    "   first to look it up. program_id is optional on students and events -\n"
+    "   omit it unless the user names a program.\n"
     "2. When adding a student, put the given password in the password column.\n"
     "3. For events, always set starts_at to a full ISO datetime.\n"
     "4. To rename/update or delete a record, pass a `match` such as\n"
@@ -116,6 +126,33 @@ def _rows(response):
     return getattr(response, "data", None) or []
 
 
+def _check_foreign_keys(table, values):
+    """Return an error string if a foreign-key value has no parent row.
+
+    This turns a would-be Postgres 23503 error into a message the model can act
+    on: it names the missing id and lists the ids that do exist.
+    """
+    for column, parent in FOREIGN_KEYS.get(table, {}).items():
+        value = values.get(column)
+        if value is None:  # column absent or explicitly null - nothing to enforce
+            continue
+
+        exists = _rows(
+            client().table(parent).select("id").eq("id", value).limit(1).execute()
+        )
+        if not exists:
+            available = _rows(
+                client().table(parent).select("id, name").limit(FIND_LIMIT).execute()
+            )
+            hint = json.dumps(available, default=str) if available else "none"
+            return (
+                f"Cannot set {column}={value!r}: no row with id {value} exists in "
+                f"'{parent}'. Existing {parent}: {hint}. "
+                f"Call db_find('{parent}', ...) for a real id, or omit {column}."
+            )
+    return None
+
+
 def db_find(table, match=None):
     """Return rows from `table` that match every key/value in `match`."""
     match = match or {}
@@ -139,6 +176,10 @@ def db_insert(table, values):
     if error:
         return error
 
+    fk_error = _check_foreign_keys(table, values)
+    if fk_error:
+        return fk_error
+
     if not confirm(f"insert into {table}: {values}"):
         return "User declined the insert."
 
@@ -153,6 +194,10 @@ def db_update(table, match, values):
         return error
     if not match:
         return "Refusing to update without a match (that would change every row)."
+
+    fk_error = _check_foreign_keys(table, values)
+    if fk_error:
+        return fk_error
 
     if not confirm(f"update {table} where {match} -> set {values}"):
         return "User declined the update."
